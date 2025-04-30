@@ -32,7 +32,6 @@ static const uint8_t KEY_USAGE  = 0x42;         // 0x42 = F9; see USB HID Usage 
 
 // ================= Debug Flag ====================
 #ifndef DEBUG_ENABLED            // set to 1 for serial logs while testing, 0 when deploying to save power
-  #define DEBUG_ENABLED 0
 #define DEBUG_ENABLED 1
 #endif
 
