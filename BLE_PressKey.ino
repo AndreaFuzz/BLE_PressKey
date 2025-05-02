@@ -1,25 +1,37 @@
 /**
- * 
- // Hassinator – Always-On Bluetooth Keyboard
- // Copyright (c) 2025 AndreaFuzz <https://github.com/AndreaFuzz/>
- // SPDX-License-Identifier: MIT
+ *  Hassinator – Always-On Bluetooth Keyboard
+ *  2025 AndreaFuzz  ·  SPDX-License-Identifier: MIT
  *
- * with NeoPixel LED, battery service, factory reset
+ *  ────────────────────────────────────────────────────────────────────
+ *  Hardware
+ *    • ESP32-C3 Super Mini  (Arduino-ESP32 ≥ 3.2.0  +  NimBLE-Arduino 2.2.3)
+ *    • Momentary button on GPIO-4, pulled-up internally (LOW when pressed)
+ *    • Single NeoPixel (RGB LED) on GPIO-8
  *
- * - Built for ESP32-C3 Super Mini (Arduino-ESP32 ≥ 3.2.0 + NimBLE-Arduino v2.2.3)
- * - Button on GPIO4 (hold ≥ 3 s → factory reset, short press → key press + deep-sleep)
- * - On-board NeoPixel on GPIO8
- * - Battery service fixed at 100 % (Windows requirement for HID-over-GATT)
- * - LED states:
- *     · BLINK BLUE   : advertising
- *     · SOLID GREEN  : connected
- *     · SOLID RED    : factory reset
- *     · HALF WHITE   : sending key
+ *  Behaviour recap
+ *    • Short press        → send one F9 keystroke via HID-over-GATT, then sleep
+ *    • 3-second long press→ factory-reset all Bluetooth bonds,   then sleep
+ *
+ *  Battery-saving rules
+ *    1. 60-second advertising watchdog  
+ *       If still unpaired after 60 s (LED blinking blue), go to deep-sleep.
+ *    2. 5-second idle watchdog after the very first successful pairing  
+ *       If no button press occurs within 5 s of a new link (LED solid green),
+ *       assume the host just wanted to pair and let the MCU sleep.
+ *
+ *  LED legend
+ *    · BLINK BLUE   advertising / waiting to pair
+ *    · SOLID GREEN  connected
+ *    · SOLID RED    factory-reset in progress
+ *    · HALF WHITE   sending key report
+ *  ────────────────────────────────────────────────────────────────────
  */
 
-/* ======== Easy-to-edit settings ======================================== */
-static const char*  DEVICE_NAME = "Hassinator"; // Change this to rename the peripheral
-static const uint8_t KEY_USAGE  = 0x42;         // 0x42 = F9; see USB HID Usage Tables
+#include <stdint.h>  // ensures uint8_t is known before we use it
+
+/* ======== Easy-to-edit identifiers ==================================== */
+static const char*  DEVICE_NAME = "Hassinator";   // BLE peripheral name
+static const uint8_t KEY_USAGE  = 0x42;           // USB-HID usage code for F9
 /* ======================================================================= */
 
 #include <Arduino.h>
@@ -30,9 +42,9 @@ static const uint8_t KEY_USAGE  = 0x42;         // 0x42 = F9; see USB HID Usage 
 #include "driver/gpio.h"
 #include <Adafruit_NeoPixel.h>
 
-// ================= Debug Flag ====================
-#ifndef DEBUG_ENABLED            // set to 1 for serial logs while testing, 0 when deploying to save power
-#define DEBUG_ENABLED 1
+/* ================= Debug output ======================================== */
+#ifndef DEBUG_ENABLED                 // 1 = serial logs, 0 = max battery
+  #define DEBUG_ENABLED 0
 #endif
 
 #if DEBUG_ENABLED
@@ -43,14 +55,26 @@ static const uint8_t KEY_USAGE  = 0x42;         // 0x42 = F9; see USB HID Usage 
   #define DEBUG_INIT()   ((void)0)
 #endif
 
-// ================= Pins & Timings ================
-static constexpr gpio_num_t  BUTTON_PIN   = GPIO_NUM_4; // press = GND
-static constexpr int         WS2812_PIN   = 8;
-static constexpr int         WS2812_CNT   = 1;
-static constexpr uint32_t    FACTORY_MS   = 3000; // 3 seconds → factory reset
-static constexpr uint32_t    LED_BLINK_MS = 400;  // blink toggle interval
+/* ================= GPIO & timing constants ============================ */
+static constexpr gpio_num_t BUTTON_PIN   = GPIO_NUM_4; // LOW when pressed
+static constexpr int        WS2812_PIN   = 8;
+static constexpr int        WS2812_CNT   = 1;
 
-// ================ LED Enums/Vars =================
+static constexpr uint32_t   FACTORY_MS   = 3000;  // ≥3 s hold → factory reset
+static constexpr uint32_t   LED_BLINK_MS = 400;   // 0.4 s on / 0.4 s off
+
+/* --- POWER-SAVE --------------------------------------------------------- */
+/* 60 000 ms watchdog: if still unpaired (advertising) after this period,
+ * cut current consumption to zero by entering deep-sleep.                */
+static constexpr uint32_t   ADV_TIMEOUT_MS  = 60000;
+
+/* 5 000 ms idle timer: starts the moment the very first connection is
+ * established.  If the user never presses the button, we assume they only
+ * wanted to pair; sleep to preserve battery.  Any button press resets it. */
+static constexpr uint32_t   CONNECT_IDLE_MS = 5000;
+/* ---------------------------------------------------------------------- */
+
+/* ====================== LED helper ===================================== */
 enum LEDMode {
   LED_OFF,
   LED_BLINK_BLUE,   // advertising
@@ -64,49 +88,32 @@ LEDMode            currentLEDMode  = LED_OFF;
 uint32_t           lastBlinkToggle = 0;
 bool               ledOn           = false;
 
-void setPixelColor(uint8_t r, uint8_t g, uint8_t b) {
-  neo.clear();
-  neo.setPixelColor(0, neo.Color(r, g, b));
-  neo.show();
+inline void setPixelColor(uint8_t r, uint8_t g, uint8_t b) {
+  neo.clear(); neo.setPixelColor(0, neo.Color(r, g, b)); neo.show();
 }
-
-void setLEDMode(LEDMode mode) {
-  currentLEDMode = mode;
+inline void setLEDMode(LEDMode mode) {
+  currentLEDMode  = mode;
   lastBlinkToggle = millis();
-  ledOn = false;
+  ledOn           = false;
 }
-
 void updateLED() {
   switch (currentLEDMode) {
-    case LED_OFF:
-      setPixelColor(0, 0, 0);
-      break;
-
+    case LED_OFF:          setPixelColor(0,0,0); break;
     case LED_BLINK_BLUE: {
       uint32_t now = millis();
       if (now - lastBlinkToggle >= LED_BLINK_MS) {
         lastBlinkToggle = now;
         ledOn = !ledOn;
-        if (ledOn) setPixelColor(0, 0, 255);
-        else       setPixelColor(0, 0, 0);
+        setPixelColor(0,0, ledOn ? 255 : 0);
       }
     } break;
-
-    case LED_SOLID_GREEN:
-      setPixelColor(0, 255, 0);
-      break;
-
-    case LED_SOLID_RED:
-      setPixelColor(255, 0, 0);
-      break;
-
-    case LED_HALF_WHITE:
-      setPixelColor(128, 128, 128);
-      break;
+    case LED_SOLID_GREEN:  setPixelColor(0,255,0);     break;
+    case LED_SOLID_RED:    setPixelColor(255,0,0);     break;
+    case LED_HALF_WHITE:   setPixelColor(128,128,128); break;
   }
 }
 
-// =============== Globals =========================
+/* ====================== Globals ======================================== */
 Preferences           prefs;
 NimBLEHIDDevice*      hid                 = nullptr;
 NimBLECharacteristic* inputRpt           = nullptr;
@@ -115,7 +122,11 @@ bool                  factoryResetPending = false;
 bool                  pendingKey          = false;
 unsigned long         pressStart          = 0;
 
-// HID Keyboard report w/ Report ID = 1
+/* Timers used by the power-save rules */
+unsigned long         advStartTime        = 0;  // millis() when adverts began
+unsigned long         connStartTime       = 0;  // millis() when link came up
+
+/* ====================== HID report map ================================= */
 static const uint8_t keyboardReportMap[] = {
   0x05,0x01, 0x09,0x06, 0xA1,0x01,
     0x85,0x01, 0x05,0x07, 0x19,0xE0, 0x29,0xE7,
@@ -126,159 +137,178 @@ static const uint8_t keyboardReportMap[] = {
   0xC0
 };
 
-// ================ Factory Reset ==================
+/* ====================== Factory-reset helpers ========================== */
 void eraseAllBonds() {
-  if (NimBLEDevice::deleteAllBonds()) {
+  if (NimBLEDevice::deleteAllBonds())
     LOG("[RESET] all Bluetooth bonds erased");
-  } else {
+  else
     LOG("[RESET] no bonds found or deletion failed");
-  }
 }
-
 void doFactoryReset() {
   LOG("[RESET] factory reset");
   setLEDMode(LED_SOLID_RED);
   unsigned long t0 = millis();
   while (millis() - t0 < 2000) { updateLED(); delay(25); }
 
-  eraseAllBonds();
+  eraseAllBonds();                        // remove stored pairings
   setLEDMode(LED_BLINK_BLUE);
-  NimBLEDevice::startAdvertising();
+  NimBLEDevice::startAdvertising();       // reopen for pairing
   factoryResetPending = false;
+  advStartTime = millis();                // restart 60 s advert watchdog
 }
 
-// ================ Send Key =======================
+/* ====================== Keystroke routine ============================== */
 void sendKey() {
+  /* Press-and-release sequence for F9 (usage 0x42) */
   delay(100);
   LOG("[KEY] sending usage 0x%02X", KEY_USAGE);
   setLEDMode(LED_HALF_WHITE);
 
   uint8_t report[8] = {0};
-  /* press */
-  report[2] = KEY_USAGE;
+  report[2] = KEY_USAGE;                         // press
   inputRpt->setValue(report, sizeof(report));
   inputRpt->notify();
   delay(15);
-  /* release */
-  memset(report, 0, sizeof(report));
+  memset(report, 0, sizeof(report));             // release
   inputRpt->setValue(report, sizeof(report));
   inputRpt->notify();
 
   LOG("[KEY] sent");
-  if (deviceConnected) setLEDMode(LED_SOLID_GREEN);
-  else                 setLEDMode(LED_BLINK_BLUE);
+  setLEDMode(deviceConnected ? LED_SOLID_GREEN
+                             : LED_BLINK_BLUE);
 }
 
-// ================ Server Callbacks ===============
+/* ====================== BLE server callbacks =========================== */
 class ServerCB : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer*, NimBLEConnInfo&) override {
+  void onConnect   (NimBLEServer*, NimBLEConnInfo&) override {
     deviceConnected = true;
     LOG("[LINK] up");
     setLEDMode(LED_SOLID_GREEN);
+    connStartTime = millis();            // start 5 s idle countdown
   }
   void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int reason) override {
     deviceConnected = false;
     LOG("[LINK] down (reason=%d)", reason);
     setLEDMode(LED_BLINK_BLUE);
+    NimBLEDevice::startAdvertising();    // ready for next host
+    advStartTime = millis();             // new 60 s advert watchdog
   }
 };
 
-// ============== Bluetooth & Setup ======================
+/* ====================== BLE stack setup ================================ */
 void setupBLE() {
   NimBLEDevice::init(DEVICE_NAME);
-  NimBLEDevice::setPower(ESP_PWR_LVL_N0);
-  NimBLEDevice::setSecurityAuth(true, false, true);
+
+#if defined(ESP_PWR_LVL_N2)              // –6 dBm on most ESP32 cores
+  NimBLEDevice::setPower(ESP_PWR_LVL_N2);
+#else
+  NimBLEDevice::setPower(ESP_PWR_LVL_N6); // fallback enum name
+#endif
+  NimBLEDevice::setSecurityAuth(true, false, true); // bonding, no MITM/PIN
 
   NimBLEServer* server = NimBLEDevice::createServer();
   server->setCallbacks(new ServerCB());
 
+  /* HID service -------------------------------------------------------- */
   hid = new NimBLEHIDDevice(server);
   hid->setManufacturer("MyCompany");
-  hid->setHidInfo(0x0111, 0x00);
+  hid->setHidInfo(0x0111, 0x00);                   // HID 1.11
   hid->setReportMap((uint8_t*)keyboardReportMap, sizeof(keyboardReportMap));
   inputRpt = hid->getInputReport(1);
   hid->startServices();
 
-  // Battery service (100 %)
+  /* Battery service (always 100 %) ------------------------------------ */
   auto* batt = server->createService(NimBLEUUID((uint16_t)0x180F));
   uint8_t lvl = 100;
   batt->createCharacteristic(NimBLEUUID((uint16_t)0x2A19),
-    NIMBLE_PROPERTY::READ)->setValue(&lvl, 1);
+                             NIMBLE_PROPERTY::READ)->setValue(&lvl, 1);
   batt->start();
 
+  /* Advertising -------------------------------------------------------- */
   auto adv = NimBLEDevice::getAdvertising();
   adv->setName(DEVICE_NAME);
-  adv->setAppearance(0x03C4); // Keyboard
+  adv->setAppearance(0x03C4);                      // Generic Keyboard
   adv->addServiceUUID(hid->getHidService()->getUUID());
-  adv->setMinInterval(32);
-  adv->setMaxInterval(48);
+  adv->setMinInterval(32); adv->setMaxInterval(48);
   adv->start();
   LOG("[ADV] start");
+
+  advStartTime = millis();                         // arm advert watchdog
 }
 
-// ================= Deep Sleep ====================
+/* ====================== Deep-sleep wrapper ============================= */
 void enterDeepSleep() {
   LOG("[POWER] entering deep sleep…");
-  /* turn LED off explicitly */
-  neo.clear();
-  neo.show();
+  neo.clear(); neo.show();                         // LED off
   currentLEDMode = LED_OFF;
 
   NimBLEDevice::stopAdvertising();
-  NimBLEDevice::deinit(true);
+  NimBLEDevice::deinit(true);                      // shut down BLE stack
 
-  gpio_hold_en(BUTTON_PIN);
-
-  esp_deep_sleep_enable_gpio_wakeup((1ULL << BUTTON_PIN),
+  gpio_hold_en(BUTTON_PIN);                        // hold state during sleep
+  esp_deep_sleep_enable_gpio_wakeup((1ULL<<BUTTON_PIN),
                                     ESP_GPIO_WAKEUP_GPIO_LOW);
-  esp_deep_sleep_start();
+  esp_deep_sleep_start();                          // Z-z-z-z…
 }
 
-// ============ Arduino Setup ======================
+/* ====================== Arduino setup ================================= */
 void setup() {
   DEBUG_INIT();
   LOG("[Boot] starting up…");
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
-  neo.begin();
-  neo.setBrightness(128);             // 50 % global brightness
-  neo.clear();
-  neo.show();
+  neo.begin(); neo.setBrightness(128); neo.clear(); neo.show();
 
   setupBLE();
-  setLEDMode(LED_BLINK_BLUE);
+  setLEDMode(LED_BLINK_BLUE);                      // waiting for host
 }
 
-// ============ Main Loop ==========================
+/* ====================== Main loop ===================================== */
 void loop() {
-  updateLED();
+  updateLED();                                     // animate LED modes
 
-  /* Handle pending key once connected */
-  if (pendingKey && deviceConnected) {
-    pendingKey = false;
-    sendKey();
-    delay(100); // allow host to process keystroke
+  /* -------- Advert watchdog: sleep if still unpaired after 60 s -------- */
+  if (!deviceConnected && (millis() - advStartTime >= ADV_TIMEOUT_MS)) {
+    LOG("[POWER] advert timeout → sleep");
     enterDeepSleep();
   }
 
-  /* ===== Button handling ===== */
+  /* -------- Post-pair idle: sleep 5 s after first link ---------------- */
+  if (deviceConnected &&
+      !pendingKey &&
+      (digitalRead(BUTTON_PIN) == HIGH) &&          // button idle
+      (millis() - connStartTime >= CONNECT_IDLE_MS)) {
+    LOG("[POWER] idle after pair → sleep");
+    enterDeepSleep();
+  }
+
+  /* -------- Deferred key (button pressed before pairing) -------------- */
+  if (pendingKey && deviceConnected) {
+    pendingKey = false;
+    sendKey();
+    delay(100);                                    // allow host to process
+    enterDeepSleep();
+  }
+
+  /* -------- Button state machine ------------------------------------- */
   bool pressed = (digitalRead(BUTTON_PIN) == LOW);
   static bool wasPressed = false;
 
-  if (pressed && !wasPressed) {         // button down
+  if (pressed && !wasPressed) {                    // button went down
     wasPressed = true;
     pressStart = millis();
     LOG("[BTN] down");
+    connStartTime = millis();                      // reset idle timer
   }
 
-  if (!pressed && wasPressed) {         // button released
+  if (!pressed && wasPressed) {                    // button went up
     wasPressed = false;
     uint32_t heldMs = millis() - pressStart;
     LOG("[BTN] up after %lu ms", heldMs);
     pressStart = 0;
 
     if (!factoryResetPending && heldMs < FACTORY_MS) {
-      /* short press → send F9 (only when linked) */
+      /* Short tap → send F9 (only when linked) */
       if (deviceConnected) {
         sendKey();
         delay(100);
@@ -288,11 +318,12 @@ void loop() {
         pendingKey = true;
         setLEDMode(LED_BLINK_BLUE);
         NimBLEDevice::startAdvertising();
+        advStartTime = millis();                   // restart 60 s watchdog
       }
     }
   }
 
-  /* Long-press factory reset */
+  /* -------- Long-press factory reset ---------------------------------- */
   if (pressed && wasPressed && !factoryResetPending) {
     if ((millis() - pressStart) >= FACTORY_MS) {
       factoryResetPending = true;
@@ -300,5 +331,5 @@ void loop() {
     }
   }
 
-  delay(20);
+  delay(20);                                       // ≈50 Hz loop
 }
